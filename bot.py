@@ -1,18 +1,19 @@
 """
 АлкоПартнёр — Telegram-бот для поиска по прайс-листу МАИ + пиво
-Версия: финальная
+Версия: обновлённая (повтор заказа, аналитика по товарам, свой период, автоочистка чата)
 
 Установка:
-  pip install python-telegram-bot pandas xlrd==1.2.0 openpyxl requests
+  pip install python-telegram-bot pandas xlrd==1.2.0 openpyxl gspread google-auth
 
 Запуск:
   python bot.py
 """
 
-import os, re, json, logging, sys, requests, pandas as pd
+import os, re, json, logging, sys, pandas as pd
 import gspread
 from google.oauth2.service_account import Credentials
-from datetime import datetime
+from collections import defaultdict
+from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
@@ -21,15 +22,13 @@ from telegram.ext import (
 
 # ══════════════════════════════════════════════════════════════════
 TOKEN          = os.environ.get("BOT_TOKEN", "8974641448:AAFhIYLya0lVhRsldJj4a2UXNKvXv0rQPD8")
-GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "AIzaSyCJzZvFuEAz534XWnqHj3lysKWjDox9dKU")
-GOOGLE_CX      = os.environ.get("GOOGLE_CX",      "641ca1d3242234c40")
 PRICE_XLS      = "price.xls"
 PRICE_BEER     = "pricepivo.xls"
 ORDERS_FILE    = "orders.txt"
 ORDERS_JSON    = "orders.json"
-PHOTO_CACHE    = "photo_cache.json"
 GOOGLE_SHEET_ID   = os.environ.get("GOOGLE_SHEET_ID", "")
 GOOGLE_CREDS_JSON = os.environ.get("GOOGLE_CREDS_JSON", "")
+KNOWN_CLIENTS_LIMIT = 8
 # ══════════════════════════════════════════════════════════════════
 
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
@@ -39,9 +38,6 @@ df_price     = None
 _name_index: list[str] = []
 df_beer      = None
 _beer_index: list[str] = []
-_photo_cache: dict = {}
-
-HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0"}
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -52,16 +48,31 @@ def normalize(t: str) -> str:
     return re.sub(r"\s+", " ", t.lower().strip().replace(".", ","))
 
 
-def load_photo_cache():
-    global _photo_cache
-    try:
-        if os.path.exists(PHOTO_CACHE):
-            with open(PHOTO_CACHE, encoding="utf-8") as f:
-                _photo_cache = json.load(f)
-    except Exception:
-        _photo_cache = {}
+# ─────────────────────────────────────────────────────────────────
+# АВТООЧИСТКА ЧАТА ОТ СЛУЖЕБНЫХ СООБЩЕНИЙ
+# ─────────────────────────────────────────────────────────────────
+# Идея: результаты поиска, подтверждения "добавлено в корзину" и запросы
+# цены продажи — временные (flow) сообщения. Как только появляется новое
+# сообщение того же типа, предыдущее удаляется. На "чекпоинтах" (открыли
+# корзину, подтвердили заказ, начали новый заказ) очередь чистится совсем.
 
-load_photo_cache()
+async def _clear_flow(context, bot, chat_id):
+    ids = context.user_data.pop("flow_msgs", [])
+    for mid in ids:
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=mid)
+        except Exception:
+            pass
+
+async def _set_flow(context, bot, chat_id, new_ids):
+    await _clear_flow(context, bot, chat_id)
+    context.user_data["flow_msgs"] = [i for i in new_ids if i]
+
+async def _delete_one(bot, chat_id, message_id):
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception:
+        pass
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -97,18 +108,19 @@ def get_sheet():
 
 
 def save_order_to_sheets(cart, buy_tot, sell_tot, margin):
-    """Дописывает строку заказа в Google Sheets."""
+    """Дописывает строку заказа в Google Sheets (включая JSON с позициями,
+    чтобы аналитика по товарам и повтор заказа работали и через Sheets)."""
     sheet = get_sheet()
     if sheet is None:
         return False
     try:
-        now      = datetime.now().strftime("%d.%m.%Y %H:%M")
-        # Формируем список позиций в одну строку
+        now = datetime.now().strftime("%d.%m.%Y %H:%M")
         items_str = "; ".join(
             f"{i['name']} ×{i['qty']} по {i['price']:.2f}₽"
             + (f" → продажа {i['sell_price']:.2f}₽" if i.get("sell_price") else "")
             for i in cart["items"]
         )
+        items_json = json.dumps(cart["items"], ensure_ascii=False)
         sheet.append_row([
             now,
             cart["client"],
@@ -116,6 +128,7 @@ def save_order_to_sheets(cart, buy_tot, sell_tot, margin):
             round(sell_tot, 2),
             round(margin,   2),
             items_str,
+            items_json,
         ])
         logger.info("Заказ записан в Google Sheets")
         return True
@@ -125,24 +138,30 @@ def save_order_to_sheets(cart, buy_tot, sell_tot, margin):
 
 
 def load_orders_from_sheets() -> list:
-    """Загружает все заказы из Google Sheets."""
+    """Загружает все заказы из Google Sheets, включая позиции (колонка G)."""
     sheet = get_sheet()
     if sheet is None:
         return []
     try:
         rows   = sheet.get_all_values()
         orders = []
-        for row in rows[1:]:  # пропускаем заголовок
+        for row_num, row in enumerate(rows[1:], start=2):  # пропускаем заголовок
             if len(row) < 5 or not row[0]:
                 continue
             try:
-                # Парсим дату обратно в нужный формат
                 dt_str = row[0]
                 try:
                     dt_obj = datetime.strptime(dt_str, "%d.%m.%Y %H:%M")
                     dt_iso = dt_obj.strftime("%Y-%m-%d %H:%M:%S")
                 except Exception:
                     dt_iso = dt_str
+
+                items = []
+                if len(row) > 6 and row[6]:
+                    try:
+                        items = json.loads(row[6])
+                    except Exception:
+                        items = []
 
                 orders.append({
                     "dt":         dt_iso,
@@ -151,7 +170,8 @@ def load_orders_from_sheets() -> list:
                     "sell_total": float(row[3]) if len(row) > 3 and row[3] else 0,
                     "margin":     float(row[4]) if len(row) > 4 and row[4] else 0,
                     "items_str":  row[5] if len(row) > 5 else "",
-                    "items":      [],  # детали позиций не храним отдельно в Sheets
+                    "items":      items,
+                    "sheet_row":  row_num,
                 })
             except Exception:
                 continue
@@ -159,44 +179,6 @@ def load_orders_from_sheets() -> list:
     except Exception as e:
         logger.error(f"load_orders_from_sheets: {e}")
         return []
-
-
-
-def find_photo(name: str, barcode: str = "") -> str | None:
-    key = name[:80]
-    if key in _photo_cache:
-        return _photo_cache[key]
-    url = None
-    if barcode and barcode not in ("", "nan", "0"):
-        try:
-            r = requests.get(
-                f"https://world.openfoodfacts.org/api/v0/product/{barcode}.json",
-                headers=HEADERS, timeout=6)
-            p = r.json().get("product", {})
-            url = p.get("image_url") or p.get("image_front_url")
-        except Exception:
-            pass
-    if not url and GOOGLE_API_KEY and GOOGLE_CX:
-        try:
-            short = " ".join(re.sub(r"\(.*?\)", "", name).strip().split()[:4])
-            r = requests.get(
-                "https://www.googleapis.com/customsearch/v1",
-                params={"key": GOOGLE_API_KEY, "cx": GOOGLE_CX,
-                        "q": short + " бутылка", "searchType": "image",
-                        "num": 1, "imgSize": "medium"},
-                timeout=8)
-            items = r.json().get("items", [])
-            if items:
-                url = items[0].get("link")
-        except Exception:
-            pass
-    _photo_cache[key] = url
-    try:
-        with open(PHOTO_CACHE, "w", encoding="utf-8") as f:
-            json.dump(_photo_cache, f, ensure_ascii=False)
-    except Exception:
-        pass
-    return url
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -248,7 +230,6 @@ def load_beer_from_xlsx(xlsx_path: str):
         ext = os.path.splitext(xlsx_path)[1].lower()
 
         if ext == ".xls":
-            # Читаем через xlrd (старый формат)
             import xlrd
             wb   = xlrd.open_workbook(xlsx_path)
             rows = []
@@ -257,7 +238,6 @@ def load_beer_from_xlsx(xlsx_path: str):
                 rows.append(sh.row_values(rx)[:3])
             raw = pd.DataFrame(rows, columns=["name", "price_factory", "price_nw"])
         else:
-            # Читаем через openpyxl (новый формат)
             raw = pd.read_excel(xlsx_path, header=None, engine="openpyxl")
             raw = raw.iloc[:, :3]
             raw.columns = ["name", "price_factory", "price_nw"]
@@ -265,13 +245,11 @@ def load_beer_from_xlsx(xlsx_path: str):
         raw["price_factory"] = pd.to_numeric(raw["price_factory"], errors="coerce")
         raw["price_nw"]      = pd.to_numeric(raw["price_nw"],      errors="coerce")
 
-        # Оставляем только строки с реальной ценой
         df = raw[raw["price_factory"].notna() & (raw["price_factory"] > 0)].copy()
         df["name"] = df["name"].astype(str).str.strip()
         df = df[df["name"] != ""]
         df = df[~df["name"].str.upper().isin(["NAN", "НАИМЕНОВАНИЕ", "НАЗВАНИЕ",
                                                "ЗАВОД НАЛ", "ЦЕНА СЕВЕРО ЗАПАД"])]
-        # Убираем строки-разделители (только объём без цены — например "0,45 стекло")
         df = df[df["name"].str.len() > 5]
 
         df_beer     = df.reset_index(drop=True)
@@ -346,6 +324,24 @@ def do_search_beer(query, min_price=None, max_price=None):
     if df_beer is None:
         return []
     return _search(_beer_index, df_beer, query, min_price, max_price, "price_factory")
+
+
+def find_current_price_and_stock(name: str):
+    """Пытается найти актуальную цену/остаток по названию из прошлого заказа
+    (используется при повторе заказа, т.к. прайс мог обновиться)."""
+    is_beer = name.startswith("🍺 ")
+    clean = name[2:].strip() if is_beer else name
+    if is_beer and df_beer is not None:
+        matches = df_beer[df_beer["name"] == clean]
+        if not matches.empty:
+            r = matches.iloc[0]
+            return float(r["price_factory"]), None
+    elif not is_beer and df_price is not None:
+        matches = df_price[df_price["name"] == clean]
+        if not matches.empty:
+            r = matches.iloc[0]
+            return float(r["price"]), int(r["stock"])
+    return None, None
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -425,12 +421,11 @@ def cart_total(cart) -> float:
 
 
 # ─────────────────────────────────────────────────────────────────
-# ЗАКАЗЫ И АНАЛИТИКА
+# ЗАКАЗЫ, ИСТОРИЯ КЛИЕНТОВ, ПОВТОР ЗАКАЗА
 # ─────────────────────────────────────────────────────────────────
 
 def load_orders_json() -> list:
     """Загружает заказы: сначала из Google Sheets, потом из локального JSON."""
-    # Пробуем Google Sheets
     if GOOGLE_SHEET_ID and GOOGLE_CREDS_JSON:
         try:
             orders = load_orders_from_sheets()
@@ -438,7 +433,6 @@ def load_orders_json() -> list:
                 return orders
         except Exception as e:
             logger.warning(f"Sheets fallback to JSON: {e}")
-    # Локальный JSON как запасной вариант
     try:
         if os.path.exists(ORDERS_JSON):
             with open(ORDERS_JSON, encoding="utf-8") as f:
@@ -446,6 +440,48 @@ def load_orders_json() -> list:
     except Exception:
         pass
     return []
+
+
+def get_known_clients(limit: int = KNOWN_CLIENTS_LIMIT) -> list[str]:
+    """Список клиентов от самых недавних заказов, без повторов."""
+    orders = load_orders_json()
+    seen = []
+    for o in reversed(orders):
+        c = (o.get("client") or "").strip()
+        if c and c not in seen:
+            seen.append(c)
+        if len(seen) >= limit:
+            break
+    return seen
+
+
+def get_last_order_for_client(client: str) -> dict | None:
+    orders = load_orders_json()
+    for o in reversed(orders):
+        if (o.get("client") or "").strip().lower() == client.strip().lower():
+            return o
+    return None
+
+
+def build_cart_from_last_order(cart: dict, last_order: dict) -> list[str]:
+    """Заполняет корзину позициями из прошлого заказа, обновляя цену/остаток
+    по текущему прайсу там, где это возможно. Возвращает список предупреждений."""
+    warnings = []
+    cart["items"] = []
+    for it in last_order.get("items", []):
+        name = it.get("name", "")
+        qty  = int(it.get("qty", 1))
+        stored_price = float(it.get("price", 0))
+        cur_price, stock = find_current_price_and_stock(name)
+        if cur_price is not None:
+            price = cur_price
+            if stock is not None and stock < qty:
+                warnings.append(f"⚠️ {name}: в наличии только {stock} шт. (запрошено {qty})")
+        else:
+            price = stored_price
+            warnings.append(f"⚠️ {name}: не найден в текущем прайсе, взята прошлая цена {stored_price:.2f}₽")
+        cart["items"].append({"name": name, "price": price, "qty": qty, "sell_price": None})
+    return warnings
 
 
 def save_order(cart):
@@ -487,14 +523,12 @@ def save_order(cart):
                    "price": i["price"], "sell_price": i.get("sell_price")}
                   for i in cart["items"]]
     }
-    # Сохраняем в Google Sheets (основное хранилище)
     sheets_ok = save_order_to_sheets(cart, buy_tot, sell_tot, margin)
     if sheets_ok:
         logger.info("Заказ → Google Sheets ✅")
     else:
         logger.warning("Google Sheets недоступен, сохраняем в JSON")
 
-    # JSON как резервное хранилище
     try:
         history = []
         if os.path.exists(ORDERS_JSON):
@@ -507,55 +541,102 @@ def save_order(cart):
         logger.warning(f"save JSON: {e}")
 
 
-def analytics_for_period(orders: list, days: int) -> str:
-    from datetime import timedelta
-    cutoff  = datetime.now() - timedelta(days=days)
-    period  = [o for o in orders
-               if datetime.strptime(o["dt"], "%Y-%m-%d %H:%M:%S") >= cutoff]
+# ─────────────────────────────────────────────────────────────────
+# АНАЛИТИКА — маржа по клиентам И по товарам, произвольный период
+# ─────────────────────────────────────────────────────────────────
+
+def _orders_in_range(orders, start_dt, end_dt):
+    result = []
+    for o in orders:
+        try:
+            dt = datetime.strptime(o["dt"], "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            continue
+        if start_dt <= dt <= end_dt:
+            result.append(o)
+    return result
+
+
+def analytics_for_range(orders: list, start_dt: datetime, end_dt: datetime) -> str:
+    period = _orders_in_range(orders, start_dt, end_dt)
     if not period:
         return "Заказов за этот период нет."
+
     buy    = sum(o["buy_total"]  for o in period)
     sell   = sum(o["sell_total"] for o in period)
     margin = sum(o["margin"]     for o in period)
-    from collections import defaultdict
-    by_client = defaultdict(float)
+
+    by_client  = defaultdict(lambda: {"margin": 0.0, "orders": 0})
+    by_product = defaultdict(lambda: {"margin": 0.0, "qty": 0})
+    has_items  = False
+
     for o in period:
-        by_client[o["client"]] += o["margin"]
-    top = sorted(by_client.items(), key=lambda x: -x[1])[:5]
+        by_client[o["client"]]["margin"] += o["margin"]
+        by_client[o["client"]]["orders"] += 1
+        for it in o.get("items", []):
+            has_items = True
+            name  = it.get("name", "?")
+            qty   = int(it.get("qty", 0))
+            price = float(it.get("price", 0))
+            sp    = float(it.get("sell_price") or price)
+            by_product[name]["margin"] += (sp - price) * qty
+            by_product[name]["qty"]    += qty
+
+    top_clients  = sorted(by_client.items(),  key=lambda x: -x[1]["margin"])[:5]
+    top_products = sorted(by_product.items(), key=lambda x: -x[1]["margin"])[:5]
+
     lines = [
         f"📊 Заказов: *{len(period)}*",
         f"📦 Закупка: *{buy:.0f} ₽*",
         f"💸 Продажа: *{sell:.0f} ₽*",
         f"📈 Маржа: *{margin:.0f} ₽*",
     ]
-    if top:
-        lines += ["", "🏆 *Топ клиентов:*"]
-        for client, m in top:
-            lines.append(f"  • {client}: {m:.0f} ₽")
+    if top_clients:
+        lines += ["", "🏆 *Топ клиентов по марже:*"]
+        for client, d in top_clients:
+            lines.append(f"  • {client}: {d['margin']:.0f} ₽ ({d['orders']} зак.)")
+    if has_items and top_products:
+        lines += ["", "📦 *Топ товаров по марже:*"]
+        for name, d in top_products:
+            lines.append(f"  • {name[:40]}: {d['margin']:.0f} ₽ ({d['qty']} шт.)")
+    elif not has_items:
+        lines += ["", "_ℹ️ Разбивка по товарам недоступна для заказов, оформленных до обновления бота_"]
     return "\n".join(lines)
 
 
+def analytics_for_period(orders: list, days: int) -> str:
+    end   = datetime.now()
+    start = end - timedelta(days=days)
+    return analytics_for_range(orders, start, end)
+
+
 # ─────────────────────────────────────────────────────────────────
-# ПОДСКАЗКА ПО КЛИЕНТУ
+# ПОДСКАЗКА / ИСТОРИЯ ЦЕН ПО КЛИЕНТУ
 # ─────────────────────────────────────────────────────────────────
 
-def client_price_hint(client: str, product_name: str) -> str:
+def client_item_history(client: str, product_name: str) -> list[float]:
     if not client:
-        return ""
+        return []
     prices = []
     for o in load_orders_json():
-        if o.get("client", "").lower() != client.lower():
+        if (o.get("client") or "").strip().lower() != client.strip().lower():
             continue
         for item in o.get("items", []):
             if product_name.lower() in item.get("name", "").lower():
                 sp = item.get("sell_price")
                 if sp:
                     prices.append(float(sp))
+    return prices
+
+
+def client_price_hint(client: str, product_name: str) -> str:
+    prices = client_item_history(client, product_name)
     if not prices:
         return ""
+    trend = " → ".join(f"{p:.0f}" for p in prices[-3:])
     return (
         f"💡 *Подсказка по {client}:*\n"
-        f"   Последняя цена продажи: *{prices[-1]:.0f} ₽*\n"
+        f"   История продаж: {trend} ₽\n"
         f"   Средняя: *{sum(prices)/len(prices):.0f} ₽*\n\n"
     )
 
@@ -580,6 +661,7 @@ def main_menu_kb() -> InlineKeyboardMarkup:
 
 
 async def send_main_menu(msg_obj, context):
+    await _clear_flow(context, context.bot, msg_obj.chat_id)
     n      = len(df_price) if df_price is not None else 0
     status = f"\n✅ Алко: *{n}* поз." if n else "\n⚠️ Алко прайс не загружен"
     if df_beer is not None:
@@ -630,28 +712,16 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ПОИСК И ВЫВОД РЕЗУЛЬТАТОВ
 # ─────────────────────────────────────────────────────────────────
 
-async def _delete_messages_later(bot, chat_id: int, message_ids: list[int], delay: int = 120):
-    """Удаляет список сообщений через delay секунд."""
-    import asyncio
-    await asyncio.sleep(delay)
-    for mid in message_ids:
-        try:
-            await bot.delete_message(chat_id=chat_id, message_id=mid)
-        except Exception:
-            pass
-
-
-async def _send_alco_results(msg_obj, results, query, context=None):
+async def _send_alco_results(msg_obj, results, query, extra_ids=None) -> list[int]:
     if not results:
         await msg_obj.reply_text(f"🍷 «{query}» — не найдено в алко прайсе.")
-        return
+        return []
     MAX = 20
     hdr = f"🍷 *{len(results)}* позиций по «{query}»"
     if len(results) > MAX:
         hdr += f"\n_(первые {MAX})_"
-    hdr += "\n_⏱ Результаты исчезнут через 2 минуты_"
 
-    sent_ids = []
+    sent_ids = list(extra_ids or [])
     m = await msg_obj.reply_text(hdr, parse_mode="Markdown")
     sent_ids.append(m.message_id)
 
@@ -684,25 +754,19 @@ async def _send_alco_results(msg_obj, results, query, context=None):
         m = await msg_obj.reply_text(text, parse_mode="Markdown", reply_markup=kb)
         sent_ids.append(m.message_id)
 
-    # Запускаем удаление через 2 минуты
-    if context:
-        import asyncio
-        asyncio.create_task(
-            _delete_messages_later(context.bot, msg_obj.chat_id, sent_ids, delay=120)
-        )
+    return sent_ids
 
 
-async def _send_beer_results(msg_obj, results, query, context=None):
+async def _send_beer_results(msg_obj, results, query, extra_ids=None) -> list[int]:
     if not results:
         await msg_obj.reply_text(f"🍺 «{query}» — не найдено в пивном прайсе.")
-        return
+        return []
     MAX = 20
     hdr = f"🍺 *{len(results)}* позиций по «{query}»"
     if len(results) > MAX:
         hdr += f"\n_(первые {MAX})_"
-    hdr += "\n_⏱ Результаты исчезнут через 2 минуты_"
 
-    sent_ids = []
+    sent_ids = list(extra_ids or [])
     m = await msg_obj.reply_text(hdr, parse_mode="Markdown")
     sent_ids.append(m.message_id)
 
@@ -724,16 +788,44 @@ async def _send_beer_results(msg_obj, results, query, context=None):
         m = await msg_obj.reply_text(text, parse_mode="Markdown", reply_markup=kb)
         sent_ids.append(m.message_id)
 
-    if context:
-        import asyncio
-        asyncio.create_task(
-            _delete_messages_later(context.bot, msg_obj.chat_id, sent_ids, delay=120)
-        )
+    return sent_ids
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     aw   = context.user_data.get("awaiting")
+    chat_id = update.message.chat_id
+
+    # ── Ожидание дат для аналитики за свой период ─────────────────
+    if aw == "stats_from":
+        try:
+            dt = datetime.strptime(text, "%d.%m.%Y")
+        except ValueError:
+            await update.message.reply_text("Формат даты: `ДД.ММ.ГГГГ`, например `01.06.2026`", parse_mode="Markdown")
+            return
+        context.user_data["stats_from"] = dt
+        context.user_data["awaiting"] = "stats_to"
+        await update.message.reply_text("Введи дату окончания периода (`ДД.ММ.ГГГГ`):", parse_mode="Markdown")
+        return
+
+    if aw == "stats_to":
+        try:
+            dt_to = datetime.strptime(text, "%d.%m.%Y")
+        except ValueError:
+            await update.message.reply_text("Формат даты: `ДД.ММ.ГГГГ`", parse_mode="Markdown")
+            return
+        dt_from = context.user_data.pop("stats_from", None)
+        context.user_data.pop("awaiting", None)
+        if dt_from is None:
+            await update.message.reply_text("Начни заново: /stats")
+            return
+        dt_to_full = dt_to.replace(hour=23, minute=59, second=59)
+        stats_text = analytics_for_range(load_orders_json(), dt_from, dt_to_full)
+        await update.message.reply_text(
+            f"📊 *Аналитика {dt_from.strftime('%d.%m.%Y')} — {dt_to.strftime('%d.%m.%Y')}*\n\n{stats_text}",
+            parse_mode="Markdown"
+        )
+        return
 
     # ── Ожидание имени клиента ────────────────────────────────────
     if aw == "client":
@@ -756,20 +848,21 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 row = df_price.iloc[pending["idx"]]
                 add_to_cart(cart, row["name"], float(row["price"]), pending["qty"])
                 added_msg = f"✅ *{row['name']}* × {pending['qty']} шт.\n\n"
-        await update.message.reply_text(
+        m = await update.message.reply_text(
             f"👤 Клиент: *{cart['client']}*\n\n{added_msg}"
             + fmt_cart(cart) + "\n\nИщи товары или /confirm",
             parse_mode="Markdown"
         )
+        await _set_flow(context, context.bot, chat_id, [m.message_id, update.message.message_id])
         return
 
     # ── Ожидание количества (алко) ────────────────────────────────
     if aw == "qty":
-        m = re.search(r'\d+', text)
-        if not m:
+        m_ = re.search(r'\d+', text)
+        if not m_:
             await update.message.reply_text("Введи число, например `6`", parse_mode="Markdown")
             return
-        qty = int(m.group())
+        qty = int(m_.group())
         context.user_data.pop("awaiting", None)
         idx = context.user_data.pop("pending_idx", None)
         if idx is not None and df_price is not None:
@@ -778,23 +871,25 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not cart["client"]:
                 context.user_data["awaiting"] = "client"
                 context.user_data["pending"]  = {"idx": idx, "qty": qty}
-                await update.message.reply_text("👤 Введи имя клиента:")
+                m = await update.message.reply_text("👤 Введи имя клиента:")
+                await _set_flow(context, context.bot, chat_id, [m.message_id, update.message.message_id])
                 return
             add_to_cart(cart, row["name"], float(row["price"]), qty)
             hint = client_price_hint(cart["client"], row["name"])
-            await update.message.reply_text(
+            m = await update.message.reply_text(
                 f"✅ *{row['name']}* × {qty} шт.\n{hint}" + fmt_cart(cart) + "\n\nИщи или /confirm",
                 parse_mode="Markdown"
             )
+            await _set_flow(context, context.bot, chat_id, [m.message_id, update.message.message_id])
         return
 
     # ── Ожидание количества (пиво) ────────────────────────────────
     if aw == "beer_qty":
-        m = re.search(r'\d+', text)
-        if not m:
+        m_ = re.search(r'\d+', text)
+        if not m_:
             await update.message.reply_text("Введи число, например `6`", parse_mode="Markdown")
             return
-        qty = int(m.group())
+        qty = int(m_.group())
         idx = context.user_data.pop("pending_beer_idx", None)
         context.user_data.pop("awaiting", None)
         if idx is not None and df_beer is not None:
@@ -803,24 +898,26 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not cart["client"]:
                 context.user_data["awaiting"] = "client"
                 context.user_data["pending"]  = {"beer_idx": idx, "qty": qty, "price_type": "factory"}
-                await update.message.reply_text("👤 Введи имя клиента:")
+                m = await update.message.reply_text("👤 Введи имя клиента:")
+                await _set_flow(context, context.bot, chat_id, [m.message_id, update.message.message_id])
                 return
             name  = f"🍺 {row['name']}"
             price = float(row["price_factory"])
             add_to_cart(cart, name, price, qty)
-            await update.message.reply_text(
+            m = await update.message.reply_text(
                 f"✅ *{name}* × {qty} шт.\n" + fmt_cart(cart) + "\n\nИщи или /confirm",
                 parse_mode="Markdown"
             )
+            await _set_flow(context, context.bot, chat_id, [m.message_id, update.message.message_id])
         return
 
     # ── Ожидание нового количества при редактировании ────────────
     if aw == "edit_qty":
-        m = re.search(r'\d+', text)
-        if not m:
+        m_ = re.search(r'\d+', text)
+        if not m_:
             await update.message.reply_text("Введи число, например `6`", parse_mode="Markdown")
             return
-        qty  = int(m.group())
+        qty  = int(m_.group())
         idx  = context.user_data.pop("edit_idx", None)
         context.user_data.pop("awaiting", None)
         cart = get_cart(context)
@@ -834,12 +931,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── Ожидание цены перепродажи ─────────────────────────────────
     if aw == "sell_price":
-        m = re.search(r'[\d.,]+', text.replace(",", "."))
-        if not m:
+        m_ = re.search(r'[\d.,]+', text.replace(",", "."))
+        if not m_:
             await update.message.reply_text("Введи число, например `390`", parse_mode="Markdown")
             return
         try:
-            price = float(m.group().replace(",", "."))
+            price = float(m_.group().replace(",", "."))
         except ValueError:
             await update.message.reply_text("Введи число, например `390`", parse_mode="Markdown")
             return
@@ -848,6 +945,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if idx < len(cart["items"]):
             cart["items"][idx]["sell_price"] = price
         context.user_data["sell_idx"] = idx + 1
+        await _delete_one(context.bot, chat_id, update.message.message_id)
         await _ask_sell_price(update.message, context)
         return
 
@@ -859,10 +957,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📤 Загрузи прайс — отправь `.xls` файл.")
         return
 
-    # Оба прайса загружены — спрашиваем категорию
     if df_price is not None and df_beer is not None:
         context.user_data["pending_search"] = text
-        await update.message.reply_text(
+        m = await update.message.reply_text(
             f"Ищем «{text}» — выбери категорию:",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("🍷 Алкоголь", callback_data="cat:alco"),
@@ -870,6 +967,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton("🔍 Везде",    callback_data="cat:all"),
             ]])
         )
+        await _set_flow(context, context.bot, chat_id, [m.message_id, update.message.message_id])
         return
 
     query, min_p, max_p = parse_price_filter(text)
@@ -878,7 +976,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if df_price is None:
         results = do_search_beer(query, min_p, max_p)
-        await _send_beer_results(update.message, results, query, context)
+        ids = await _send_beer_results(update.message, results, query, extra_ids=[update.message.message_id])
+        if ids:
+            await _set_flow(context, context.bot, chat_id, ids)
         return
 
     results = do_search(query, min_p, max_p)
@@ -906,21 +1006,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton("➕ 12",  callback_data=f"add:12:{row.name}"),
                 InlineKeyboardButton("➕ ...", callback_data=f"addx:{row.name}"),
             ]])
-        photo = find_photo(row["name"], str(row.get("barcode", "")))
-        sent  = False
-        if photo:
-            try:
-                await update.message.reply_photo(
-                    photo=photo, caption=card, parse_mode="Markdown", reply_markup=kb
-                )
-                sent = True
-            except Exception:
-                pass
-        if not sent:
-            await update.message.reply_text(card, parse_mode="Markdown", reply_markup=kb)
+        m = await update.message.reply_text(card, parse_mode="Markdown", reply_markup=kb)
+        await _set_flow(context, context.bot, chat_id, [m.message_id, update.message.message_id])
         return
 
-    await _send_alco_results(update.message, results, query, context)
+    ids = await _send_alco_results(update.message, results, query, extra_ids=[update.message.message_id])
+    if ids:
+        await _set_flow(context, context.bot, chat_id, ids)
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -938,20 +1030,29 @@ async def cb_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query, min_p, max_p = parse_price_filter(raw)
     if not query.strip():
         query = raw
+
     if cat == "alco":
-        await _send_alco_results(q.message, do_search(query, min_p, max_p), query, context)
+        ids = await _send_alco_results(q.message, do_search(query, min_p, max_p), query,
+                                        extra_ids=[q.message.message_id])
+        if ids:
+            await _set_flow(context, context.bot, q.message.chat_id, ids)
     elif cat == "beer":
-        await _send_beer_results(q.message, do_search_beer(query, min_p, max_p), query, context)
+        ids = await _send_beer_results(q.message, do_search_beer(query, min_p, max_p), query,
+                                        extra_ids=[q.message.message_id])
+        if ids:
+            await _set_flow(context, context.bot, q.message.chat_id, ids)
     else:
         alco = do_search(query, min_p, max_p)
         beer = do_search_beer(query, min_p, max_p)
         if not alco and not beer:
             await q.message.reply_text(f"🔍 «{query}» — нигде не найдено.")
             return
+        all_ids = [q.message.message_id]
         if alco:
-            await _send_alco_results(q.message, alco, query, context)
+            all_ids += await _send_alco_results(q.message, alco, query)
         if beer:
-            await _send_beer_results(q.message, beer, query, context)
+            all_ids += await _send_beer_results(q.message, beer, query)
+        await _set_flow(context, context.bot, q.message.chat_id, all_ids)
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -964,11 +1065,13 @@ async def cb_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parts  = q.data.split(":", 2)
     action = parts[0]
     idx    = int(parts[-1])
+    chat_id = q.message.chat_id
 
     if action == "addx":
         context.user_data["awaiting"]    = "qty"
         context.user_data["pending_idx"] = idx
-        await q.message.reply_text("Введи количество штук:")
+        m = await q.message.reply_text("Введи количество штук:")
+        await _set_flow(context, context.bot, chat_id, [m.message_id])
         return
 
     qty  = int(parts[1])
@@ -978,7 +1081,8 @@ async def cb_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not cart["client"]:
         context.user_data["awaiting"] = "client"
         context.user_data["pending"]  = {"idx": idx, "qty": qty}
-        await q.message.reply_text("👤 Введи имя клиента:")
+        m = await q.message.reply_text("👤 Введи имя клиента:")
+        await _set_flow(context, context.bot, chat_id, [m.message_id])
         return
 
     has_p = pd.notna(row.get("promo_price")) and float(row.get("promo_price", 0)) > 0
@@ -987,7 +1091,7 @@ async def cb_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
         base  = float(row["price"])
         cond  = str(row.get("promo_cond", "")).strip()
         cond_s = f"\n📋 Условие: _{cond}_" if cond else ""
-        await q.message.reply_text(
+        m = await q.message.reply_text(
             f"📦 *{row['name']}* × {qty} шт.\n\nВыбери цену закупки:{cond_s}",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[
@@ -995,14 +1099,16 @@ async def cb_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton(f"🎯 Маркетинг {promo:.2f}₽", callback_data=f"price:promo:{idx}:{qty}"),
             ]])
         )
+        await _set_flow(context, context.bot, chat_id, [m.message_id])
         return
 
     add_to_cart(cart, row["name"], float(row["price"]), qty)
     hint = client_price_hint(cart["client"], row["name"])
-    await q.message.reply_text(
+    m = await q.message.reply_text(
         f"✅ *{row['name']}* × {qty} шт.\n{hint}" + fmt_cart(cart) + "\n\nИщи или /confirm",
         parse_mode="Markdown"
     )
+    await _set_flow(context, context.bot, chat_id, [m.message_id])
 
 
 async def cb_price_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1024,11 +1130,12 @@ async def cb_price_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     add_to_cart(cart, row["name"], price, qty)
     hint = client_price_hint(cart["client"], row["name"])
-    await q.message.reply_text(
+    m = await q.message.reply_text(
         f"✅ *{row['name']}* × {qty} шт. ({label}: {price:.2f}₽)\n{hint}"
         + fmt_cart(cart) + "\n\nИщи или /confirm",
         parse_mode="Markdown"
     )
+    await _set_flow(context, context.bot, q.message.chat_id, [m.message_id])
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -1040,12 +1147,14 @@ async def cb_beer_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     parts  = q.data.split(":")
     action = parts[0]
+    chat_id = q.message.chat_id
 
     if action == "baddx":
         idx = int(parts[1])
         context.user_data["awaiting"]         = "beer_qty"
         context.user_data["pending_beer_idx"] = idx
-        await q.message.reply_text("Введи количество штук:")
+        m = await q.message.reply_text("Введи количество штук:")
+        await _set_flow(context, context.bot, chat_id, [m.message_id])
         return
 
     qty        = int(parts[1])
@@ -1063,16 +1172,18 @@ async def cb_beer_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not cart["client"]:
         context.user_data["awaiting"] = "client"
         context.user_data["pending"]  = {"beer_idx": idx, "qty": qty, "price_type": price_type}
-        await q.message.reply_text("👤 Введи имя клиента:")
+        m = await q.message.reply_text("👤 Введи имя клиента:")
+        await _set_flow(context, context.bot, chat_id, [m.message_id])
         return
 
     add_to_cart(cart, name, price, qty)
     hint = client_price_hint(cart["client"], row["name"])
-    await q.message.reply_text(
+    m = await q.message.reply_text(
         f"✅ *{name}* × {qty} шт. ({label}: {price:.2f}₽)\n{hint}"
         + fmt_cart(cart) + "\n\nИщи или /confirm",
         parse_mode="Markdown"
     )
+    await _set_flow(context, context.bot, chat_id, [m.message_id])
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -1080,6 +1191,7 @@ async def cb_beer_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─────────────────────────────────────────────────────────────────
 
 async def _cmd_cart_msg(msg_obj, context):
+    await _clear_flow(context, context.bot, msg_obj.chat_id)
     cart = get_cart(context)
     if not cart["items"]:
         await msg_obj.reply_text(
@@ -1124,6 +1236,7 @@ async def cb_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _show_edit_menu(msg_obj, context):
+    await _clear_flow(context, context.bot, msg_obj.chat_id)
     cart  = get_cart(context)
     lines = ["✏️ *Редактирование корзины*\n"]
     btns  = []
@@ -1188,6 +1301,7 @@ async def cmd_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["awaiting"] = "client"
         await update.message.reply_text("👤 Введи имя клиента:")
         return
+    await _clear_flow(context, context.bot, update.message.chat_id)
     await update.message.reply_text(
         fmt_cart(cart, title="📋 *Итог заказа*") + "\n\nПодтверди или вернись к редактированию:",
         parse_mode="Markdown",
@@ -1209,6 +1323,7 @@ async def cb_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     elif action == "ok":
         save_order(cart)
+        await _clear_flow(context, context.bot, q.message.chat_id)
         await q.message.edit_text(
             fmt_cart(cart, title="✅ *Заказ принят*"), parse_mode="Markdown"
         )
@@ -1217,7 +1332,7 @@ async def cb_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ─────────────────────────────────────────────────────────────────
-# ЦЕНЫ ПЕРЕПРОДАЖИ
+# ЦЕНЫ ПЕРЕПРОДАЖИ (всегда с историей цен клиента)
 # ─────────────────────────────────────────────────────────────────
 
 async def _ask_sell_price(msg_obj, context):
@@ -1226,6 +1341,7 @@ async def _ask_sell_price(msg_obj, context):
     if idx >= len(cart["items"]):
         context.user_data.pop("sell_idx", None)
         context.user_data.pop("awaiting", None)
+        await _clear_flow(context, context.bot, msg_obj.chat_id)
         await msg_obj.reply_text(
             fmt_cart(cart, title="✅ *Цены введены*") + "\n\n/confirm — подтвердить",
             parse_mode="Markdown"
@@ -1235,17 +1351,27 @@ async def _ask_sell_price(msg_obj, context):
     p_s   = f"{item['price']:.2f}".rstrip("0").rstrip(".")
     cur   = (f"текущая: *{item['sell_price']:.2f} ₽*"
              if item.get("sell_price") else f"цена закупки: *{p_s} ₽*")
-    await msg_obj.reply_text(
+
+    hist = client_item_history(cart["client"], item["name"])
+    if hist:
+        trend = " → ".join(f"{p:.0f}" for p in hist[-3:])
+        hist_line = f"📜 Ранее продавал по: {trend} ₽ (сред. {sum(hist)/len(hist):.0f} ₽)\n"
+    else:
+        hist_line = "📜 Раньше этому клиенту не продавали этот товар\n"
+
+    m = await msg_obj.reply_text(
         f"💸 *Цена продажи {idx+1} из {len(cart['items'])}*\n\n"
         f"📦 {item['name']}\n"
         f"   Закупка: *{p_s} ₽* × {item['qty']} шт.\n"
-        f"   {cur}\n\nВведи цену продажи или пропусти:",
+        f"   {cur}\n"
+        f"{hist_line}\nВведи цену продажи или пропусти:",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("➡️ Оставить", callback_data=f"sell:skip:{idx}"),
         ]])
     )
     context.user_data["awaiting"] = "sell_price"
+    await _set_flow(context, context.bot, msg_obj.chat_id, [m.message_id])
 
 async def cmd_sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cart = get_cart(context)
@@ -1275,6 +1401,7 @@ async def cmd_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _show_orders_page(update.message, context, page=0)
 
 async def _show_orders_page(msg_obj, context, page: int = 0):
+    await _clear_flow(context, context.bot, msg_obj.chat_id)
     orders   = load_orders_json()
     total    = len(orders)
     per_page = 5
@@ -1311,7 +1438,6 @@ async def _show_orders_page(msg_obj, context, page: int = 0):
 
 
 async def cb_view_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает полную информацию по конкретному заказу."""
     q   = update.callback_query
     await q.answer()
     idx = int(q.data.split(":")[1])
@@ -1334,7 +1460,6 @@ async def cb_view_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "",
     ]
 
-    # Если есть детальные позиции (из JSON)
     if items:
         lines.append("📦 *ЗАКУПКА:*")
         for item in items:
@@ -1360,7 +1485,6 @@ async def cb_view_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"💰 *Итого продажа: {sell:.2f} ₽*")
             lines.append(f"📈 *Маржа: {margin:.2f} ₽*")
     else:
-        # Из Google Sheets — показываем строку позиций
         items_str = o.get("items_str", "")
         if items_str:
             lines.append("📦 *Позиции:*")
@@ -1386,72 +1510,181 @@ async def cb_orders_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _show_orders_page(q.message, context, page=page)
 
 async def cb_delete_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Удаляет заказ. Работает и для заказов из Google Sheets (по номеру строки),
+    и для локального JSON — раньше при работе через Sheets заказ "удалялся"
+    только из JSON и появлялся снова при следующей загрузке."""
     q   = update.callback_query
     await q.answer()
     idx = int(q.data.split(":")[1])
     orders = load_orders_json()
-    if 0 <= idx < len(orders):
-        removed = orders.pop(idx)
-        try:
+    if not (0 <= idx < len(orders)):
+        return
+    removed = orders[idx]
+
+    if "sheet_row" in removed:
+        sheet = get_sheet()
+        if sheet is not None:
+            try:
+                sheet.delete_rows(removed["sheet_row"])
+            except Exception as e:
+                logger.warning(f"delete sheet row: {e}")
+
+    try:
+        if os.path.exists(ORDERS_JSON):
+            with open(ORDERS_JSON, encoding="utf-8") as f:
+                local = json.load(f)
+            local = [o for o in local
+                     if not (o.get("dt") == removed.get("dt") and o.get("client") == removed.get("client"))]
             with open(ORDERS_JSON, "w", encoding="utf-8") as f:
-                json.dump(orders, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            logger.warning(f"delete order: {e}")
-        client = removed.get("client", "?")
-        dt     = removed.get("dt", "")[:10]
-        await q.message.reply_text(
-            f"🗑 Заказ *{client}* от {dt} удалён. Осталось: {len(orders)}",
-            parse_mode="Markdown"
-        )
-        if orders:
-            await _show_orders_page(q.message, context, page=0)
+                json.dump(local, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.warning(f"delete local order: {e}")
+
+    client = removed.get("client", "?")
+    dt     = removed.get("dt", "")[:10]
+    remaining = load_orders_json()
+    await q.message.reply_text(
+        f"🗑 Заказ *{client}* от {dt} удалён. Осталось: {len(remaining)}",
+        parse_mode="Markdown"
+    )
+    if remaining:
+        await _show_orders_page(q.message, context, page=0)
 
 
 # ─────────────────────────────────────────────────────────────────
 # АНАЛИТИКА
 # ─────────────────────────────────────────────────────────────────
 
+def _stats_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("📅 День",   callback_data="stats:1"),
+        InlineKeyboardButton("📆 Неделя", callback_data="stats:7"),
+        InlineKeyboardButton("🗓 Месяц",  callback_data="stats:30"),
+    ], [
+        InlineKeyboardButton("📆 Свой период", callback_data="stats:custom"),
+    ]])
+
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     orders = load_orders_json()
     if not orders:
         await update.message.reply_text("📊 Нет данных. Подтверди хотя бы один заказ.")
         return
+    await _clear_flow(context, context.bot, update.message.chat_id)
     await update.message.reply_text(
         "📊 *Аналитика — выбери период:*",
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("📅 День",   callback_data="stats:1"),
-            InlineKeyboardButton("📆 Неделя", callback_data="stats:7"),
-            InlineKeyboardButton("🗓 Месяц",  callback_data="stats:30"),
-        ]])
+        reply_markup=_stats_kb()
     )
 
 async def cb_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q      = update.callback_query
+    q   = update.callback_query
     await q.answer()
-    days   = int(q.data.split(":")[1])
+    val = q.data.split(":")[1]
+
+    if val == "custom":
+        context.user_data["awaiting"] = "stats_from"
+        await q.message.reply_text(
+            "Введи дату начала периода (`ДД.ММ.ГГГГ`), например `01.06.2026`:",
+            parse_mode="Markdown"
+        )
+        return
+
+    days   = int(val)
     labels = {1: "сегодня", 7: "за неделю", 30: "за месяц"}
     text   = analytics_for_period(load_orders_json(), days)
     await q.message.edit_text(
         f"📊 *Аналитика — {labels[days]}*\n\n{text}",
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("📅 День",   callback_data="stats:1"),
-            InlineKeyboardButton("📆 Неделя", callback_data="stats:7"),
-            InlineKeyboardButton("🗓 Месяц",  callback_data="stats:30"),
-        ]])
+        reply_markup=_stats_kb()
     )
 
 
 # ─────────────────────────────────────────────────────────────────
-# НОВЫЙ ЗАКАЗ
+# НОВЫЙ ЗАКАЗ — выбор из недавних клиентов + повтор заказа
 # ─────────────────────────────────────────────────────────────────
 
-async def cmd_neworder(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["cart"]    = {"client": "", "items": []}
-    context.user_data["awaiting"] = "client"
+async def _start_new_order(msg_obj, context):
+    context.user_data["cart"] = {"client": "", "items": []}
     context.user_data.pop("pending", None)
-    await update.message.reply_text("🛒 Новый заказ.\n\n👤 Введи имя клиента:")
+    context.user_data.pop("awaiting", None)
+    await _clear_flow(context, context.bot, msg_obj.chat_id)
+
+    clients = get_known_clients()
+    if not clients:
+        context.user_data["awaiting"] = "client"
+        await msg_obj.reply_text("🛒 Новый заказ.\n\n👤 Введи имя клиента:")
+        return
+
+    context.user_data["known_clients"] = clients
+    btns = [[InlineKeyboardButton(c, callback_data=f"neword:pick:{i}")] for i, c in enumerate(clients)]
+    btns.append([InlineKeyboardButton("➕ Другой клиент", callback_data="neword:other")])
+    await msg_obj.reply_text(
+        "🛒 *Новый заказ*\n\n👤 Выбери клиента или добавь нового:",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(btns)
+    )
+
+async def cmd_neworder(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _start_new_order(update.message, context)
+
+async def cb_neword(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q      = update.callback_query
+    await q.answer()
+    parts  = q.data.split(":")
+    action = parts[1]
+    cart   = get_cart(context)
+
+    if action == "other":
+        context.user_data["awaiting"] = "client"
+        await q.message.reply_text("👤 Введи имя клиента:")
+        return
+
+    if action == "pick":
+        idx = int(parts[2])
+        clients = context.user_data.get("known_clients", [])
+        if idx >= len(clients):
+            await q.message.reply_text("Список устарел, начни заново: /neworder")
+            return
+        client = clients[idx]
+        cart["client"] = client
+        last = get_last_order_for_client(client)
+        if last and last.get("items"):
+            n_items = len(last["items"])
+            await q.message.reply_text(
+                f"👤 Клиент: *{client}*\n\nНайден прошлый заказ ({n_items} поз.). Повторить его или собрать новый?",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton(f"🔁 Повторить ({n_items} поз.)", callback_data="neword:repeat"),
+                    InlineKeyboardButton("🆕 Собрать новый", callback_data="neword:fresh"),
+                ]])
+            )
+        else:
+            await q.message.reply_text(
+                f"👤 Клиент: *{client}*\n\nИщи товары для заказа.",
+                parse_mode="Markdown"
+            )
+        return
+
+    if action == "repeat":
+        client = cart.get("client", "")
+        last = get_last_order_for_client(client)
+        if not last or not last.get("items"):
+            await q.message.reply_text("Не нашёл детальный прошлый заказ. Собери вручную.")
+            return
+        warnings = build_cart_from_last_order(cart, last)
+        text = fmt_cart(cart, title="🔁 *Заказ восстановлен*")
+        if warnings:
+            text += "\n\n" + "\n".join(warnings)
+        text += "\n\nПроверь количество/цены и жми /confirm, либо ищи товары чтобы добавить ещё."
+        await q.message.reply_text(text, parse_mode="Markdown")
+        return
+
+    if action == "fresh":
+        await q.message.reply_text(
+            f"👤 Клиент: *{cart.get('client','')}*\n\nИщи товары для заказа.",
+            parse_mode="Markdown"
+        )
+        return
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -1474,10 +1707,7 @@ async def cb_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "cart":
         await _cmd_cart_msg(q.message, context)
     elif action == "neworder":
-        context.user_data["cart"]    = {"client": "", "items": []}
-        context.user_data["awaiting"] = "client"
-        context.user_data.pop("pending", None)
-        await q.message.reply_text("🛒 Новый заказ.\n\n👤 Введи имя клиента:")
+        await _start_new_order(q.message, context)
     elif action == "sell":
         cart = get_cart(context)
         if not cart["items"]:
@@ -1493,6 +1723,7 @@ async def cb_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["awaiting"] = "client"
             await q.message.reply_text("👤 Введи имя клиента:")
         else:
+            await _clear_flow(context, context.bot, q.message.chat_id)
             await q.message.reply_text(
                 fmt_cart(cart, title="📋 *Итог заказа*") + "\n\nПодтверди:",
                 parse_mode="Markdown",
@@ -1518,14 +1749,11 @@ async def cb_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not orders:
             await q.message.reply_text("📊 Нет данных по заказам.")
         else:
+            await _clear_flow(context, context.bot, q.message.chat_id)
             await q.message.reply_text(
                 "📊 *Аналитика — выбери период:*",
                 parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("📅 День",   callback_data="stats:1"),
-                    InlineKeyboardButton("📆 Неделя", callback_data="stats:7"),
-                    InlineKeyboardButton("🗓 Месяц",  callback_data="stats:30"),
-                ]])
+                reply_markup=_stats_kb()
             )
     elif action == "uploadbeer":
         context.user_data["upload_type"] = "beer"
@@ -1586,6 +1814,7 @@ def main():
     app.add_handler(CommandHandler("orders",   cmd_orders))
 
     app.add_handler(CallbackQueryHandler(cb_menu,         pattern=r"^menu:"))
+    app.add_handler(CallbackQueryHandler(cb_neword,       pattern=r"^neword:"))
     app.add_handler(CallbackQueryHandler(cb_category,     pattern=r"^cat:"))
     app.add_handler(CallbackQueryHandler(cb_add,          pattern=r"^add"))
     app.add_handler(CallbackQueryHandler(cb_price_choice, pattern=r"^price:"))
